@@ -1,67 +1,141 @@
-use std::fs;
+mod identity;
+mod protocol;
+
+use ed25519_dalek::{Signature, VerifyingKey};
+use identity::LocalIdentity;
+use protocol::*;
+use std::io::{self, BufRead, Write};
 use tokio::net::TcpStream;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use serde_json;
-use ed25519_dalek::SigningKey;
-use blake3;
 
-fn validate_password(password: &str, salt: &[u8], expected_pubkey: &[u8; 32]) -> bool {
-    let seed = derive_seed_from_password(password, salt);
-    let signing_key = SigningKey::from_bytes(&seed);
-    let derived_pubkey = signing_key.verifying_key().to_bytes();
-    
-    derived_pubkey == *expected_pubkey
+fn read_password(prompt: &str) -> io::Result<String> {
+    if let Ok(pw) = rpassword::prompt_password(prompt) {
+        return Ok(pw.trim().to_string());
+    }
+    let mut stdout = io::stdout();
+    write!(stdout, "{prompt}")?;
+    stdout.flush()?;
+    let stdin = io::stdin();
+    let mut line = String::new();
+    stdin.lock().read_line(&mut line)?;
+    Ok(line.trim().to_string())
 }
 
-fn derive_seed_from_password(password: &str, salt: &[u8]) -> [u8; 32] {
-    let mut key = [0u8; 32];
-    let hasher = blake3::Hasher::new()
-        .update(password.as_bytes())
-        .update(salt)
-        .finalize();
-    key.copy_from_slice(hasher.as_bytes());
-    key
+const SERVER_ADDR: &str = "127.0.0.1:2888";
+// hardcoded trust root — server pubkey from ur one and only sigma server
+const SERVER_PUBKEY: [u8; 32] = [
+    0xe9, 0x47, 0x10, 0x55, 0xaf, 0x1f, 0x43, 0xe4,
+    0x45, 0x26, 0x47, 0xf1, 0x91, 0xc8, 0xda, 0x85,
+    0xc7, 0xe4, 0xa2, 0x8a, 0x9f, 0xf9, 0xe6, 0x40,
+    0x3a, 0x3c, 0x94, 0x7a, 0x75, 0xf3, 0xe1, 0x57,
+];
+const IDENTITY_FILE: &str = "identity.bin";
+
+#[allow(dead_code)]
+fn verify_diddy(diddy_pubkey: &[u8; 32], sig: &[u8; 64]) -> Result<(), Box<dyn std::error::Error>> {
+    let server_vk = VerifyingKey::from_bytes(&SERVER_PUBKEY)?;
+    let signature = Signature::from_bytes(sig);
+    server_vk.verify_strict(diddy_pubkey, &signature)?;
+    Ok(())
 }
 
-#[tokio::main]  
+#[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut stream = TcpStream::connect("127.0.0.1:2888").await?;
-    
-    let magic: [u8; 4] = [0xDE, 0xAD, 0xBE, 0xEF];
-    stream.write_all(&magic).await?;
-    stream.flush().await?;
-    
-    println!("DEADBEEF sent");
-    
-    let mut buffer = [0u8; 1024];
-    let n = stream.read(&mut buffer).await?;
-    
-    let response = String::from_utf8_lossy(&buffer[..n]).to_string();
-    println!("Diddy response: {}", response);
-    
-    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&response) {
-        if let (Some(_id), Some(pubkey), Some(password), Some(salt)) = (json.get("id"), json.get("pubkey"), json.get("password"), json.get("salt")) {
-            // cache identity without the password
-            let cache = serde_json::json!({
-                "id": _id,
-                "pubkey": pubkey,
-                "salt": salt,
-            });
-            fs::write("cache_colhoz.json", cache.to_string())?;
-            if let Some(pw_str) = password.as_str() {
-                // validate password client-side without storing it
-                if let Some(salt_str) = salt.as_str().and_then(|s| hex::decode(s).ok()).filter(|v| v.len() == 16) {
-                    let mut salt_arr = [0u8; 16];
-                    salt_arr.copy_from_slice(&salt_str);
-                    if let Some(pk_bytes) = pubkey.as_str().and_then(|s| hex::decode(s).ok()).filter(|v| v.len() == 32) {
-                        let mut arr = [0u8; 32];
-                        arr.copy_from_slice(&pk_bytes);
-                        println!("password validation: {}", validate_password(pw_str, &salt_arr, &arr));
-                    }
-                }
+    if SERVER_PUBKEY == [0u8; 32] {
+        eprintln!("FIXME: hardcode SERVER_PUBKEY in main.rs");
+        return Ok(());
+    }
+
+    let mut stream = TcpStream::connect(SERVER_ADDR).await?;
+
+    if let Some(mut id) = LocalIdentity::load(IDENTITY_FILE)? {
+        let pw = read_password("password: ")?;
+        id.unlock(&pw).map_err(|_| "wrong password, you a opp")?;
+
+        if id.diddy_id.is_none() || id.server_signature.is_none() {
+            eprintln!("identity corrupted, delete {IDENTITY_FILE} and regen");
+            return Ok(());
+        }
+
+        let diddy_id = id.diddy_id.unwrap();
+
+        send_message(
+            &mut stream,
+            &ClientMessage::LoginRequest { diddy_id },
+        )
+        .await?;
+
+        let challenge = match recv_message::<ServerMessage>(&mut stream).await? {
+            ServerMessage::AuthChallenge { challenge } => challenge,
+            ServerMessage::LoginError { reason } => {
+                eprintln!("login rejected: {reason}");
+                return Ok(());
+            }
+            other => {
+                eprintln!("unexpected server msg: {other:?}");
+                return Ok(());
+            }
+        };
+
+        let sig = id.sign(&challenge);
+        send_message(
+            &mut stream,
+            &ClientMessage::LoginChallengeResponse {
+                diddy_id,
+                signature: sig,
+            },
+        )
+        .await?;
+
+        match recv_message::<ServerMessage>(&mut stream).await? {
+            ServerMessage::LoginSuccess => {
+                println!("logged in as {diddy_id}, ur so sigma");
+            }
+            ServerMessage::LoginError { reason } => {
+                eprintln!("login failed: {reason}");
+                return Ok(());
+            }
+            other => {
+                eprintln!("unexpected: {other:?}");
+                return Ok(());
+            }
+        }
+    } else {
+        let pw = read_password("new password: ")?;
+
+        let mut id = LocalIdentity::generate();
+        let pwd_hash = id.pwd_hash(&pw);
+        let pubkey = id.pubkey;
+        let salt = id.salt;
+
+        id.lock(&pw);
+
+        send_message(
+            &mut stream,
+            &ClientMessage::Register { pubkey, pwd_hash, salt },
+        )
+        .await?;
+
+        match recv_message::<ServerMessage>(&mut stream).await? {
+            ServerMessage::RegistrationSuccess {
+                diddy_id,
+                signature,
+            } => {
+                id.diddy_id = Some(diddy_id);
+                id.server_signature = Some(signature.to_vec());
+                id.save(IDENTITY_FILE)?;
+                println!("registered! diddy_id = {diddy_id}");
+                println!("identity saved -> {IDENTITY_FILE}");
+            }
+            ServerMessage::RegistrationError { reason } => {
+                eprintln!("registration failed: {reason}");
+                return Ok(());
+            }
+            other => {
+                eprintln!("unexpected: {other:?}");
+                return Ok(());
             }
         }
     }
-    
+
     Ok(())
 }
