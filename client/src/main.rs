@@ -1,7 +1,8 @@
+mod crypto;
 mod identity;
+mod p2p;
 mod protocol;
 
-use ed25519_dalek::{Signature, VerifyingKey};
 use identity::LocalIdentity;
 use protocol::*;
 use std::io::{self, BufRead, Write};
@@ -21,21 +22,59 @@ fn read_password(prompt: &str) -> io::Result<String> {
 }
 
 const SERVER_ADDR: &str = "127.0.0.1:2888";
-// hardcoded trust root — server pubkey from ur one and only sigma server
 const SERVER_PUBKEY: [u8; 32] = [
-    0xe9, 0x47, 0x10, 0x55, 0xaf, 0x1f, 0x43, 0xe4,
-    0x45, 0x26, 0x47, 0xf1, 0x91, 0xc8, 0xda, 0x85,
-    0xc7, 0xe4, 0xa2, 0x8a, 0x9f, 0xf9, 0xe6, 0x40,
-    0x3a, 0x3c, 0x94, 0x7a, 0x75, 0xf3, 0xe1, 0x57,
+    0x32, 0xb0, 0xdb, 0x8e, 0x30, 0xdc, 0xa2, 0xc4,
+    0x07, 0x25, 0xfb, 0xfb, 0xc4, 0x66, 0x9d, 0x4c,
+    0xe0, 0x70, 0xaa, 0x25, 0xf9, 0x6f, 0x76, 0x56,
+    0xab, 0x2a, 0x4c, 0x53, 0x79, 0x5f, 0xf6, 0x7f,
 ];
 const IDENTITY_FILE: &str = "identity.bin";
 
-#[allow(dead_code)]
-fn verify_diddy(diddy_pubkey: &[u8; 32], sig: &[u8; 64]) -> Result<(), Box<dyn std::error::Error>> {
-    let server_vk = VerifyingKey::from_bytes(&SERVER_PUBKEY)?;
-    let signature = Signature::from_bytes(sig);
-    server_vk.verify_strict(diddy_pubkey, &signature)?;
-    Ok(())
+async fn register_with_server() -> Result<LocalIdentity, Box<dyn std::error::Error>> {
+    let mut stream = TcpStream::connect(SERVER_ADDR).await?;
+    let pw = read_password("new password: ")?;
+
+    let mut id = LocalIdentity::generate();
+    let pwd_hash = id.pwd_hash(&pw);
+    let pubkey = id.pubkey;
+    let salt = id.salt;
+
+    id.lock(&pw);
+
+    send_message(
+        &mut stream,
+        &ClientMessage::Register { pubkey, pwd_hash, salt },
+    )
+    .await?;
+
+    match recv_message::<ServerMessage>(&mut stream).await? {
+        ServerMessage::RegistrationSuccess {
+            diddy_id,
+            signature,
+        } => {
+            id.diddy_id = Some(diddy_id);
+            id.server_signature = Some(signature.to_vec());
+            id.save(IDENTITY_FILE)?;
+            println!("registered! diddy_id = {diddy_id}");
+            println!("identity saved -> {IDENTITY_FILE}");
+            id.unlock(&pw)?;
+            Ok(id)
+        }
+        ServerMessage::RegistrationError { reason } => {
+            Err(format!("registration failed: {reason}").into())
+        }
+        other => Err(format!("unexpected server msg: {other:?}").into()),
+    }
+}
+
+async fn load_and_unlock() -> Result<Option<LocalIdentity>, Box<dyn std::error::Error>> {
+    if let Some(mut id) = LocalIdentity::load(IDENTITY_FILE)? {
+        let pw = read_password("password: ")?;
+        id.unlock(&pw).map_err(|_| "wrong password, you a opp")?;
+        Ok(Some(id))
+    } else {
+        Ok(None)
+    }
 }
 
 #[tokio::main]
@@ -45,95 +84,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let mut stream = TcpStream::connect(SERVER_ADDR).await?;
+    let identity = match load_and_unlock().await? {
+        Some(id) => id,
+        None => register_with_server().await?,
+    };
 
-    if let Some(mut id) = LocalIdentity::load(IDENTITY_FILE)? {
-        let pw = read_password("password: ")?;
-        id.unlock(&pw).map_err(|_| "wrong password, you a opp")?;
-
-        if id.diddy_id.is_none() || id.server_signature.is_none() {
-            eprintln!("identity corrupted, delete {IDENTITY_FILE} and regen");
-            return Ok(());
+    let args: Vec<String> = std::env::args().collect();
+    match args.get(1).map(String::as_str) {
+        Some("listen") => {
+            let port: u16 = args
+                .get(2)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(7331);
+            p2p::listen(identity, port).await?;
         }
-
-        let diddy_id = id.diddy_id.unwrap();
-
-        send_message(
-            &mut stream,
-            &ClientMessage::LoginRequest { diddy_id },
-        )
-        .await?;
-
-        let challenge = match recv_message::<ServerMessage>(&mut stream).await? {
-            ServerMessage::AuthChallenge { challenge } => challenge,
-            ServerMessage::LoginError { reason } => {
-                eprintln!("login rejected: {reason}");
-                return Ok(());
-            }
-            other => {
-                eprintln!("unexpected server msg: {other:?}");
-                return Ok(());
-            }
-        };
-
-        let sig = id.sign(&challenge);
-        send_message(
-            &mut stream,
-            &ClientMessage::LoginChallengeResponse {
-                diddy_id,
-                signature: sig,
-            },
-        )
-        .await?;
-
-        match recv_message::<ServerMessage>(&mut stream).await? {
-            ServerMessage::LoginSuccess => {
-                println!("logged in as {diddy_id}, ur so sigma");
-            }
-            ServerMessage::LoginError { reason } => {
-                eprintln!("login failed: {reason}");
-                return Ok(());
-            }
-            other => {
-                eprintln!("unexpected: {other:?}");
-                return Ok(());
-            }
+        Some("connect") => {
+            let addr = args.get(2).expect("usage: connect <addr>");
+            p2p::connect(identity, addr).await?;
         }
-    } else {
-        let pw = read_password("new password: ")?;
-
-        let mut id = LocalIdentity::generate();
-        let pwd_hash = id.pwd_hash(&pw);
-        let pubkey = id.pubkey;
-        let salt = id.salt;
-
-        id.lock(&pw);
-
-        send_message(
-            &mut stream,
-            &ClientMessage::Register { pubkey, pwd_hash, salt },
-        )
-        .await?;
-
-        match recv_message::<ServerMessage>(&mut stream).await? {
-            ServerMessage::RegistrationSuccess {
-                diddy_id,
-                signature,
-            } => {
-                id.diddy_id = Some(diddy_id);
-                id.server_signature = Some(signature.to_vec());
-                id.save(IDENTITY_FILE)?;
-                println!("registered! diddy_id = {diddy_id}");
-                println!("identity saved -> {IDENTITY_FILE}");
-            }
-            ServerMessage::RegistrationError { reason } => {
-                eprintln!("registration failed: {reason}");
-                return Ok(());
-            }
-            other => {
-                eprintln!("unexpected: {other:?}");
-                return Ok(());
-            }
+        _ => {
+            eprintln!("usage: {} listen <port> | connect <addr>", args[0]);
         }
     }
 

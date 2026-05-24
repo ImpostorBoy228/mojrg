@@ -6,7 +6,7 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct LocalIdentity {
     pub pubkey: [u8; 32],
     encrypted_privkey: Vec<u8>,
