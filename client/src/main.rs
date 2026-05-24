@@ -1,29 +1,26 @@
 use std::fs;
 use tokio::net::TcpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use std::io::Read;
 use serde_json;
+use ed25519_dalek::SigningKey;
+use blake3;
 
-use ed25519_dalek::{SigningKey, VerifyingKey};
-
-fn validate_password(password: &str, expected_pubkey: &[u8; 32]) -> bool {
-    let seed = derive_seed_from_password(password);
-    let signing_key = SigningKey::from_bytes(&seed[0..32].try_into().unwrap());
+fn validate_password(password: &str, salt: &[u8], expected_pubkey: &[u8; 32]) -> bool {
+    let seed = derive_seed_from_password(password, salt);
+    let signing_key = SigningKey::from_bytes(&seed);
     let derived_pubkey = signing_key.verifying_key().to_bytes();
     
     derived_pubkey == *expected_pubkey
 }
-fn derive_seed_from_password(password: &str) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(password.as_bytes());
-    hasher.update(b"mojrg_p2p_salt_v1");
-    
-    let hash = hasher.finalize();
-    let bytes = hash.as_bytes();
-    
-    let mut seed = [0u8; 32];
-    seed.copy_from_slice(&bytes[0..32]);
-    seed
+
+fn derive_seed_from_password(password: &str, salt: &[u8]) -> [u8; 32] {
+    let mut key = [0u8; 32];
+    let hasher = blake3::Hasher::new()
+        .update(password.as_bytes())
+        .update(salt)
+        .finalize();
+    key.copy_from_slice(hasher.as_bytes());
+    key
 }
 
 #[tokio::main]  
@@ -43,13 +40,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Diddy response: {}", response);
     
     if let Ok(json) = serde_json::from_str::<serde_json::Value>(&response) {
-        if let (Some(id), Some(pubkey), Some(password)) = (json.get("id"), json.get("pubkey"), json.get("password")) {
-            fs::write("cache_colhoz.json", response)?;
+        if let (Some(_id), Some(pubkey), Some(password), Some(salt)) = (json.get("id"), json.get("pubkey"), json.get("password"), json.get("salt")) {
+            // cache identity without the password
+            let cache = serde_json::json!({
+                "id": _id,
+                "pubkey": pubkey,
+                "salt": salt,
+            });
+            fs::write("cache_colhoz.json", cache.to_string())?;
             if let Some(pw_str) = password.as_str() {
-                if let Some(pk_bytes) = pubkey.as_str().and_then(|s| hex::decode(s).ok()).filter(|v| v.len() == 32) {
-                    let mut arr = [0u8; 32];
-                    arr.copy_from_slice(&pk_bytes);
-                    println!("password validation: {}", validate_password(pw_str, &arr));
+                // validate password client-side without storing it
+                if let Some(salt_str) = salt.as_str().and_then(|s| hex::decode(s).ok()).filter(|v| v.len() == 16) {
+                    let mut salt_arr = [0u8; 16];
+                    salt_arr.copy_from_slice(&salt_str);
+                    if let Some(pk_bytes) = pubkey.as_str().and_then(|s| hex::decode(s).ok()).filter(|v| v.len() == 32) {
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(&pk_bytes);
+                        println!("password validation: {}", validate_password(pw_str, &salt_arr, &arr));
+                    }
                 }
             }
         }
