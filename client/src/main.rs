@@ -113,7 +113,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if let Ok(()) = p2p::announce(&mut s, port, port.wrapping_add(1)).await {
                         println!("announced port {port}");
                     }
-                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    // keep connection alive, read relay messages
+                    loop {
+                        match recv_message::<ServerMessage>(&mut s).await {
+                            Ok(ServerMessage::RelayForward { from_diddy_id, payload }) => {
+                                if let Ok(_chat) = bincode::deserialize::<ChatMessage>(&payload) {
+                                    println!("\n[msg from {from_diddy_id}]");
+                                    print!("> ");
+                                    let _ = std::io::stdout().flush();
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(_) => break,
+                        }
+                    }
                 });
                 println!("listening on port {port}");
             }
