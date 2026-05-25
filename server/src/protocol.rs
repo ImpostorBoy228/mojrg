@@ -2,7 +2,10 @@ use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub(crate) mod serde_ba {
+pub const PORT: u16 = 2888;
+pub const STUN_PORT: u16 = 2889;
+
+mod serde_ba {
     use serde::{de, Deserializer, Serializer};
 
     pub fn serialize<const N: usize, S>(data: &[u8; N], s: S) -> Result<S::Ok, S::Error>
@@ -120,71 +123,5 @@ pub async fn recv_message<T: for<'a> Deserialize<'a>>(
     }
     let mut buf = vec![0u8; len];
     stream.read_exact(&mut buf).await?;
-    Ok(bincode::deserialize(&buf)?)
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct ChatMessage {
-    pub id: uuid::Uuid,
-    pub from: u128,
-    pub to: u128,
-    pub timestamp: u64,
-    #[serde(with = "serde_ba")]
-    pub nonce: [u8; 12],
-    pub ciphertext: Vec<u8>,
-    #[serde(with = "serde_ba")]
-    pub signature: [u8; 64],
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub enum Packet {
-    HandshakeInit {
-        diddy_id: u128,
-        #[serde(with = "serde_ba")]
-        identity_pubkey: [u8; 32],
-        server_signature: Vec<u8>,
-        #[serde(with = "serde_ba")]
-        encryption_pubkey: [u8; 32],
-    },
-    Challenge {
-        challenge: [u8; 32],
-        diddy_id: u128,
-        #[serde(with = "serde_ba")]
-        identity_pubkey: [u8; 32],
-        server_signature: Vec<u8>,
-        #[serde(with = "serde_ba")]
-        encryption_pubkey: [u8; 32],
-    },
-    ChallengeResponse {
-        #[serde(with = "serde_ba")]
-        signature: [u8; 64],
-    },
-    Message(ChatMessage),
-    SyncRequest(u64),
-    SyncGive(Vec<ChatMessage>),
-}
-
-pub async fn write_packet(
-    writer: &mut (impl AsyncWrite + Unpin),
-    msg: &Packet,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let bytes = bincode::serialize(msg)?;
-    let len = (bytes.len() as u32).to_le_bytes();
-    writer.write_all(&len).await?;
-    writer.write_all(&bytes).await?;
-    Ok(())
-}
-
-pub async fn read_packet(
-    reader: &mut (impl AsyncRead + Unpin),
-) -> Result<Packet, Box<dyn std::error::Error>> {
-    let mut len_buf = [0u8; 4];
-    reader.read_exact(&mut len_buf).await?;
-    let len = u32::from_le_bytes(len_buf) as usize;
-    if len > 1_048_576 {
-        return Err("message too large".into());
-    }
-    let mut buf = vec![0u8; len];
-    reader.read_exact(&mut buf).await?;
     Ok(bincode::deserialize(&buf)?)
 }

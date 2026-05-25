@@ -4,11 +4,30 @@ use crate::identity::LocalIdentity;
 use crate::protocol::*;
 use rand::rngs::OsRng;
 use rand::RngCore;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::net::SocketAddr;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::time::timeout;
 use uuid::Uuid;
 use x25519_dalek::{EphemeralSecret, PublicKey};
 
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+#[allow(dead_code)]
+pub const STUN_PORT: u16 = 2889;
+
+/// Discover public endpoint via server's STUN endpoint
+#[allow(dead_code)]
+pub async fn stun_discover(server_addr: &str) -> Result<SocketAddr, Box<dyn std::error::Error>> {
+    let remote: SocketAddr = format!("{server_addr}:{STUN_PORT}").parse()?;
+    let sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
+    sock.send_to(b"stun", remote).await?;
+    let mut buf = [0u8; 256];
+    let (n, _) = timeout(Duration::from_secs(5), sock.recv_from(&mut buf)).await??;
+    let resp = String::from_utf8_lossy(&buf[..n]);
+    Ok(resp.trim().parse()?)
+}
+
+/// Listen for incoming P2P connections (no server relay needed)
 pub async fn listen(
     identity: LocalIdentity,
     port: u16,
@@ -22,15 +41,171 @@ pub async fn listen(
         let (stream, peer) = listener.accept().await?;
         println!("p2p connect from {peer}");
         let id = identity.clone();
-        let db = db.clone();
+        let dbc = db.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_incoming(id, stream, db).await {
+            if let Err(e) = handle_incoming(id, stream, dbc).await {
                 eprintln!("p2p error from {peer}: {e}");
             }
         });
     }
 }
 
+/// Chat: discover peer, try direct connect, fallback to relay
+pub async fn chat(
+    identity: LocalIdentity,
+    mut server_stream: TcpStream,
+    target_diddy_id: u128,
+    db: MessageDb,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // 1. announce our presence
+    let my_port = 0u16; // no incoming port
+    send_message(&mut server_stream, &ClientMessage::Announce {
+        tcp_port: my_port,
+        udp_port: my_port,
+    }).await?;
+    let _ = recv_message::<ServerMessage>(&mut server_stream).await?;
+
+    // 2. query peer location
+    send_message(&mut server_stream, &ClientMessage::QueryPeer {
+        diddy_id: target_diddy_id,
+    }).await?;
+    let peer_info = match recv_message::<ServerMessage>(&mut server_stream).await? {
+        ServerMessage::PeerInfo { ip, tcp_port, udp_port, online, .. } => {
+            println!("peer {target_diddy_id} at {ip}:{tcp_port}, online={online}");
+            Some((ip, tcp_port, udp_port, online))
+        }
+        ServerMessage::PeerNotFound => {
+            println!("peer {target_diddy_id} not found on server");
+            None
+        }
+        other => { eprintln!("unexpected: {other:?}"); None }
+    };
+
+    if let Some((ip, tcp_port, _udp_port, _online)) = peer_info {
+        // 3. try direct TCP connect
+        let addr = SocketAddr::new(ip, tcp_port);
+        match timeout(CONNECT_TIMEOUT, TcpStream::connect(&addr)).await {
+            Ok(Ok(stream)) => {
+                println!("direct P2P to {addr}");
+                return handle_outgoing(identity, stream, db).await;
+            }
+            Ok(Err(e)) => println!("direct connect failed: {e}, trying relay..."),
+            Err(_) => println!("direct connect timed out, trying relay..."),
+        }
+    }
+
+    // 4. relay fallback
+    let peer_pubkey = verify_peer(&mut server_stream, target_diddy_id).await?;
+
+    let mut shared_input = Vec::with_capacity(64);
+    shared_input.extend_from_slice(&identity.pubkey);
+    shared_input.extend_from_slice(&peer_pubkey);
+    let shared_key: [u8; 32] = blake3::hash(&shared_input).as_bytes()[..32].try_into().unwrap();
+
+    println!("relay chat with {target_diddy_id}");
+    relay_chat(identity, server_stream, target_diddy_id, peer_pubkey, shared_key, db).await
+}
+
+async fn verify_peer(
+    server_stream: &mut TcpStream,
+    peer_diddy_id: u128,
+) -> Result<[u8; 32], Box<dyn std::error::Error>> {
+    send_message(server_stream, &ClientMessage::VerifyRequest { diddy_id: peer_diddy_id }).await?;
+    match recv_message::<ServerMessage>(server_stream).await? {
+        ServerMessage::VerifyResponse { pubkey, .. } => Ok(pubkey),
+        _ => Err("verify failed".into()),
+    }
+}
+
+async fn relay_chat(
+    identity: LocalIdentity,
+    server_stream: TcpStream,
+    peer_diddy_id: u128,
+    peer_pubkey: [u8; 32],
+    shared_key: [u8; 32],
+    db: MessageDb,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let my_diddy_id = identity.diddy_id.expect("no diddy_id");
+
+    let (mut reader, mut writer) = tokio::io::split(server_stream);
+
+    // receiver task
+    let recv_db = db.clone();
+    let recv = tokio::spawn(async move {
+        loop {
+            match recv_message::<ServerMessage>(&mut reader).await {
+                Ok(ServerMessage::RelayForward { from_diddy_id, payload }) => {
+                    if from_diddy_id != peer_diddy_id { continue; }
+                    if let Ok(chat) = bincode::deserialize::<ChatMessage>(&payload) {
+                        let mut v = chat.clone();
+                        v.signature = [0u8; 64];
+                        if let Ok(bytes) = bincode::serialize(&v) {
+                            if crypto::verify_message_sig(&peer_pubkey, &bytes, &chat.signature).is_ok() {
+                                if let Ok(body) = crypto::decrypt_message(&shared_key, &chat.nonce, &chat.ciphertext) {
+                                    let body = String::from_utf8_lossy(&body).to_string();
+                                    if recv_db.get(peer_diddy_id, &chat.id.to_string()).ok().flatten().is_none() {
+                                        let _ = recv_db.insert(&stored_msg(&chat, peer_diddy_id, &body, false));
+                                    }
+                                    display_message(chat.from, my_diddy_id, &body);
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+
+    // sender task
+    let send = tokio::spawn(async move {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = std::io::stdin().read_line(&mut line).unwrap_or(0);
+            if n == 0 { break; }
+            let line = line.trim().to_string();
+            if line.is_empty() { continue; }
+
+            let id = uuid::Uuid::new_v4();
+            let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+            let (nonce, ciphertext) = crypto::encrypt_message(&shared_key, line.as_bytes());
+
+            let mut chat = ChatMessage {
+                id,
+                from: my_diddy_id,
+                to: peer_diddy_id,
+                timestamp: ts,
+                nonce,
+                ciphertext,
+                signature: [0u8; 64],
+            };
+            let msg_bytes = bincode::serialize(&chat).unwrap();
+            chat.signature = identity.sign(&msg_bytes);
+
+            let payload = bincode::serialize(&chat).unwrap();
+            if send_message(&mut writer, &ClientMessage::RelayPacket {
+                to_diddy_id: peer_diddy_id,
+                payload,
+            }).await.is_err() {
+                break;
+            }
+            display_message(my_diddy_id, my_diddy_id, &line);
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+
+    tokio::select! {
+        _ = recv => {},
+        _ = send => {},
+    }
+
+    Ok(())
+}
+
+/// Direct TCP connect (old style, no discovery)
 pub async fn connect(
     identity: LocalIdentity,
     addr: &str,
@@ -180,7 +355,7 @@ fn display_message(sender_id: u128, my_id: u128, body: &str) {
     println!("{who}:\n{body}");
 }
 
-fn stored_from_chat(
+fn stored_msg(
     chat: &ChatMessage,
     peer_diddy_id: u128,
     body: &str,
@@ -272,7 +447,7 @@ async fn do_sync(
                     Ok(b) => b,
                     Err(_) => continue,
                 };
-                db.insert(&stored_from_chat(chat, peer_id, &body, false))?;
+                db.insert(&stored_msg(chat, peer_id, &body, false))?;
                 display_message(chat.from, my_id, &body);
             }
         }
@@ -321,7 +496,7 @@ async fn messaging_loop(
                         .is_none()
                     {
                         recv_db
-                            .insert(&stored_from_chat(&chat, peer_diddy_id, &body, false))
+                            .insert(&stored_msg(&chat, peer_diddy_id, &body, false))
                             .map_err(|e| anyhow::anyhow!("db insert: {e}"))?;
                     }
                     display_message(chat.from, my_diddy_id, &body);
@@ -371,7 +546,7 @@ async fn messaging_loop(
             chat.signature = send_id.sign(&msg_bytes);
 
             send_db
-                .insert(&stored_from_chat(&chat, peer_diddy_id, line, true))
+                .insert(&stored_msg(&chat, peer_diddy_id, line, true))
                 .map_err(|e| anyhow::anyhow!("db insert: {e}"))?;
 
             match write_packet(&mut writer, &Packet::Message(chat)).await {
