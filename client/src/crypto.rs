@@ -1,6 +1,6 @@
 use chacha20poly1305::aead::{Aead, AeadCore, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
-use ed25519_dalek::{Signature, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 use x25519_dalek::{PublicKey, EphemeralSecret};
 
@@ -50,4 +50,20 @@ pub fn decrypt_message(
         .decrypt(nonce, ciphertext)
         .map_err(|e| anyhow::anyhow!("decrypt failed: {e:?}"))?;
     Ok(pt)
+}
+
+#[allow(dead_code)]
+pub fn sign_message(signing_key: &SigningKey, msg: &[u8]) -> [u8; 64] {
+    signing_key.sign(msg).to_bytes()
+}
+
+pub fn verify_message_sig(
+    pubkey: &[u8; 32],
+    msg: &[u8],
+    signature: &[u8; 64],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let vk = VerifyingKey::from_bytes(pubkey)?;
+    let sig = Signature::from_bytes(signature);
+    vk.verify_strict(msg, &sig)?;
+    Ok(())
 }

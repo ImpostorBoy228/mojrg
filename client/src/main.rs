@@ -1,9 +1,11 @@
 mod crypto;
+mod db;
 mod identity;
 mod p2p;
 mod protocol;
 
 use crate::crypto::SERVER_PUBKEY;
+use db::MessageDb;
 use identity::LocalIdentity;
 use protocol::*;
 use std::io::{self, BufRead, Write};
@@ -84,6 +86,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => register_with_server().await?,
     };
 
+    let db = MessageDb::open("mojrg_client.db")?;
+
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("listen") => {
@@ -91,11 +95,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .get(2)
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(7331);
-            p2p::listen(identity, port).await?;
+            p2p::listen(identity, port, db).await?;
         }
         Some("connect") => {
             let addr = args.get(2).expect("usage: connect <addr>");
-            p2p::connect(identity, addr).await?;
+            p2p::connect(identity, addr, db).await?;
         }
         _ => {
             eprintln!("usage: {} listen <port> | connect <addr>", args[0]);

@@ -99,6 +99,19 @@ pub async fn recv_message<T: for<'a> Deserialize<'a>>(
     Ok(bincode::deserialize(&buf)?)
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ChatMessage {
+    pub id: uuid::Uuid,
+    pub from: u128,
+    pub to: u128,
+    pub timestamp: u64,
+    #[serde(with = "serde_ba")]
+    pub nonce: [u8; 12],
+    pub ciphertext: Vec<u8>,
+    #[serde(with = "serde_ba")]
+    pub signature: [u8; 64],
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Packet {
     HandshakeInit {
@@ -122,11 +135,7 @@ pub enum Packet {
         #[serde(with = "serde_ba")]
         signature: [u8; 64],
     },
-    Message {
-        #[serde(with = "serde_ba")]
-        nonce: [u8; 12],
-        ciphertext: Vec<u8>,
-    },
+    Message(ChatMessage),
 }
 
 pub async fn write_packet(
