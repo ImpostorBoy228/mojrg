@@ -171,8 +171,119 @@ async fn handle_outgoing(
     messaging_loop(stream, shared, identity, peer_pubkey, peer_diddy_id, db).await
 }
 
+fn display_message(sender_id: u128, my_id: u128, body: &str) {
+    let who = if sender_id == my_id {
+        "you".to_string()
+    } else {
+        sender_id.to_string()
+    };
+    println!("{who}:\n{body}");
+}
+
+fn stored_from_chat(
+    chat: &ChatMessage,
+    peer_diddy_id: u128,
+    body: &str,
+    pending: bool,
+) -> crate::db::StoredMessage {
+    crate::db::StoredMessage {
+        id: chat.id.to_string(),
+        peer_id: peer_diddy_id,
+        sender_id: chat.from,
+        body: body.to_string(),
+        timestamp: chat.timestamp,
+        nonce: chat.nonce.to_vec(),
+        ciphertext: chat.ciphertext.clone(),
+        signature: chat.signature.to_vec(),
+        pending,
+    }
+}
+
+fn verify_chat(chat: &ChatMessage, pubkey: &[u8; 32]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut v = chat.clone();
+    v.signature = [0u8; 64];
+    let bytes = bincode::serialize(&v)?;
+    crypto::verify_message_sig(pubkey, &bytes, &chat.signature)?;
+    Ok(())
+}
+
+fn decrypt_body(chat: &ChatMessage, key: &[u8; 32]) -> anyhow::Result<String> {
+    let pt = crypto::decrypt_message(key, &chat.nonce, &chat.ciphertext)?;
+    Ok(String::from_utf8_lossy(&pt).to_string())
+}
+
+fn chat_from_stored(
+    m: &crate::db::StoredMessage,
+) -> Result<ChatMessage, Box<dyn std::error::Error>> {
+    let id: Uuid = m.id.parse()?;
+    let mut nonce = [0u8; 12];
+    nonce.copy_from_slice(&m.nonce);
+    let mut sig = [0u8; 64];
+    sig.copy_from_slice(&m.signature);
+    Ok(ChatMessage {
+        id,
+        from: m.sender_id,
+        to: m.peer_id,
+        timestamp: m.timestamp,
+        nonce,
+        ciphertext: m.ciphertext.clone(),
+        signature: sig,
+    })
+}
+
+async fn do_sync(
+    stream: &mut TcpStream,
+    db: &MessageDb,
+    my_id: u128,
+    peer_id: u128,
+    peer_pubkey: &[u8; 32],
+    key: &[u8; 32],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let my_ts = db.latest_timestamp(peer_id)?;
+    write_packet(stream, &Packet::SyncRequest(my_ts)).await?;
+
+    let packet = read_packet(stream).await?;
+    match packet {
+        Packet::SyncRequest(peer_ts) => {
+            let missed = db.messages_since(peer_id, peer_ts)?;
+            let mut chats = Vec::new();
+            for m in &missed {
+                if m.sender_id != my_id || m.nonce.len() != 12 || m.signature.len() != 64 {
+                    continue;
+                }
+                chats.push(chat_from_stored(m)?);
+            }
+            write_packet(stream, &Packet::SyncGive(chats)).await?;
+        }
+        _ => return Err("expected SyncRequest".into()),
+    }
+
+    let packet = read_packet(stream).await?;
+    match packet {
+        Packet::SyncGive(msgs) => {
+            for chat in &msgs {
+                if db.get(peer_id, &chat.id.to_string())?.is_some() {
+                    continue;
+                }
+                if verify_chat(chat, peer_pubkey).is_err() {
+                    continue;
+                }
+                let body = match decrypt_body(chat, key) {
+                    Ok(b) => b,
+                    Err(_) => continue,
+                };
+                db.insert(&stored_from_chat(chat, peer_id, &body, false))?;
+                display_message(chat.from, my_id, &body);
+            }
+        }
+        _ => return Err("expected SyncGive".into()),
+    }
+
+    Ok(())
+}
+
 async fn messaging_loop(
-    stream: TcpStream,
+    mut stream: TcpStream,
     key: [u8; 32],
     identity: LocalIdentity,
     peer_pubkey: [u8; 32],
@@ -180,12 +291,14 @@ async fn messaging_loop(
     db: MessageDb,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let my_diddy_id = identity.diddy_id.expect("identity missing diddy_id");
-    let (mut reader, mut writer) = tokio::io::split(stream);
 
     for msg in db.messages_since(peer_diddy_id, 0)? {
-        let who = if msg.sender_id == my_diddy_id { "you" } else { "peer" };
-        println!("[{who} @ {}] {}", msg.timestamp, msg.body);
+        display_message(msg.sender_id, my_diddy_id, &msg.body);
     }
+
+    do_sync(&mut stream, &db, my_diddy_id, peer_diddy_id, &peer_pubkey, &key).await?;
+
+    let (mut reader, mut writer) = tokio::io::split(stream);
 
     let recv_db = db.clone();
     let recv = tokio::spawn(async move {
@@ -195,26 +308,23 @@ async fn messaging_loop(
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             match packet {
                 Packet::Message(chat) => {
-                    let sig = chat.signature;
-                    let mut verify_chat = chat.clone();
-                    verify_chat.signature = [0u8; 64];
-                    let msg_bytes = bincode::serialize(&verify_chat).map_err(|e| anyhow::anyhow!("{e}"))?;
-                    crypto::verify_message_sig(&peer_pubkey, &msg_bytes, &sig)
-                        .map_err(|e| anyhow::anyhow!("bad msg sig: {e}"))?;
-
-                    let pt = crypto::decrypt_message(&key, &chat.nonce, &chat.ciphertext)?;
-                    let body = String::from_utf8_lossy(&pt).to_string();
-
-                    recv_db.insert(&crate::db::StoredMessage {
-                        id: chat.id.to_string(),
-                        peer_id: peer_diddy_id,
-                        sender_id: chat.from,
-                        body: body.clone(),
-                        timestamp: chat.timestamp,
-                    })
-                    .map_err(|e| anyhow::anyhow!("db insert: {e}"))?;
-
-                    println!("received message {}", chat.id);
+                    if verify_chat(&chat, &peer_pubkey).is_err() {
+                        continue;
+                    }
+                    let body = match decrypt_body(&chat, &key) {
+                        Ok(b) => b,
+                        Err(_) => continue,
+                    };
+                    if recv_db
+                        .get(peer_diddy_id, &chat.id.to_string())
+                        .map_err(|e| anyhow::anyhow!("{e}"))?
+                        .is_none()
+                    {
+                        recv_db
+                            .insert(&stored_from_chat(&chat, peer_diddy_id, &body, false))
+                            .map_err(|e| anyhow::anyhow!("db insert: {e}"))?;
+                    }
+                    display_message(chat.from, my_diddy_id, &body);
                 }
                 _ => {
                     anyhow::bail!("unexpected packet in messaging loop");
@@ -260,18 +370,21 @@ async fn messaging_loop(
             let msg_bytes = bincode::serialize(&chat)?;
             chat.signature = send_id.sign(&msg_bytes);
 
-            send_db.insert(&crate::db::StoredMessage {
-                id: id.to_string(),
-                peer_id: peer_diddy_id,
-                sender_id: my_diddy_id,
-                body: line.to_string(),
-                timestamp: ts,
-            })
-            .map_err(|e| anyhow::anyhow!("db insert: {e}"))?;
+            send_db
+                .insert(&stored_from_chat(&chat, peer_diddy_id, line, true))
+                .map_err(|e| anyhow::anyhow!("db insert: {e}"))?;
 
-            write_packet(&mut writer, &Packet::Message(chat))
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            match write_packet(&mut writer, &Packet::Message(chat)).await {
+                Ok(()) => {
+                    send_db
+                        .mark_not_pending(peer_diddy_id, &id.to_string())
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    display_message(my_diddy_id, my_diddy_id, line);
+                }
+                Err(e) => {
+                    eprintln!("send failed, queued: {e}");
+                }
+            }
         }
         Ok::<(), anyhow::Error>(())
     });

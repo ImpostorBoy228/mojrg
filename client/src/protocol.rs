@@ -136,6 +136,8 @@ pub enum Packet {
         signature: [u8; 64],
     },
     Message(ChatMessage),
+    SyncRequest(u64),
+    SyncGive(Vec<ChatMessage>),
 }
 
 pub async fn write_packet(
