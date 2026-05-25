@@ -102,7 +102,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => register_with_server(&identity_path).await?,
     };
 
-    let db = MessageDb::open("mojrg_client.db")?;
+    let db_path = std::path::Path::new(&identity_path).with_extension("db");
+    let db = MessageDb::open(&db_path)?;
 
     match cmd.as_str() {
         "listen" => {
