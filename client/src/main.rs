@@ -154,13 +154,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Some(a) => a.to_string(),
                     None => { eprintln!("usage: connect <addr>"); continue; }
                 };
-                let id = identity.clone();
-                let dbc = db.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = p2p::connect(id, &addr, dbc).await {
-                        eprintln!("connect error: {e}");
-                    }
-                });
+                if let Err(e) = p2p::connect(identity.clone(), &addr, db.clone()).await {
+                    eprintln!("connect error: {e}");
+                }
+                println!("\n--- connection ended ---");
             }
             "quit" => break,
             cmd => eprintln!("unknown: {cmd} (try 'help')"),
