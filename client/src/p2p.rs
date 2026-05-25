@@ -27,6 +27,19 @@ pub async fn stun_discover(server_addr: &str) -> Result<SocketAddr, Box<dyn std:
     Ok(resp.trim().parse()?)
 }
 
+/// Announce our ports to the discovery server
+pub async fn announce(
+    server_stream: &mut TcpStream,
+    tcp_port: u16,
+    udp_port: u16,
+) -> Result<(), Box<dyn std::error::Error>> {
+    send_message(server_stream, &ClientMessage::Announce { tcp_port, udp_port }).await?;
+    match recv_message::<ServerMessage>(server_stream).await? {
+        ServerMessage::AnnounceAck => Ok(()),
+        other => Err(format!("announce failed: {other:?}").into()),
+    }
+}
+
 /// Listen for incoming P2P connections (no server relay needed)
 pub async fn listen(
     identity: LocalIdentity,

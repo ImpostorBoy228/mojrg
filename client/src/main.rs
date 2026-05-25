@@ -26,34 +26,28 @@ fn read_password(prompt: &str) -> io::Result<String> {
 
 const SERVER_ADDR: &str = "212.113.99.89:2888";
 
-async fn auth_with_server(identity: &LocalIdentity) -> Result<TcpStream, Box<dyn std::error::Error>> {
-    let mut stream = TcpStream::connect(SERVER_ADDR).await?;
+async fn auth_with_server(identity: &LocalIdentity) -> Result<TcpStream, String> {
+    let mut stream = TcpStream::connect(SERVER_ADDR).await.map_err(|e| e.to_string())?;
+    let diddy_id = identity.diddy_id.ok_or("no diddy_id".to_string())?;
 
-    let diddy_id = identity.diddy_id.ok_or("no diddy_id")?;
+    send_message(&mut stream, &ClientMessage::LoginRequest { diddy_id }).await.map_err(|e| e.to_string())?;
+    let msg = recv_message::<ServerMessage>(&mut stream).await.map_err(|e| e.to_string())?;
+    let challenge = match msg {
+        ServerMessage::AuthChallenge { challenge } => challenge,
+        ServerMessage::LoginError { reason } => return Err(reason),
+        other => return Err(format!("unexpected: {other:?}")),
+    };
 
-    send_message(&mut stream, &ClientMessage::LoginRequest { diddy_id }).await?;
-    match recv_message::<ServerMessage>(&mut stream).await? {
-        ServerMessage::AuthChallenge { challenge } => {
-            let sig = identity.sign(&challenge);
-            send_message(&mut stream, &ClientMessage::LoginChallengeResponse {
-                diddy_id,
-                signature: sig,
-            }).await?;
-            match recv_message::<ServerMessage>(&mut stream).await? {
-                ServerMessage::LoginSuccess => {
-                    println!("logged in as diddy {diddy_id}");
-                    Ok(stream)
-                }
-                ServerMessage::LoginError { reason } => {
-                    Err(format!("login failed: {reason}").into())
-                }
-                other => Err(format!("unexpected: {other:?}").into()),
-            }
+    let sig = identity.sign(&challenge);
+    send_message(&mut stream, &ClientMessage::LoginChallengeResponse { diddy_id, signature: sig }).await.map_err(|e| e.to_string())?;
+    let msg = recv_message::<ServerMessage>(&mut stream).await.map_err(|e| e.to_string())?;
+    match msg {
+        ServerMessage::LoginSuccess => {
+            println!("logged in as diddy {diddy_id}");
+            Ok(stream)
         }
-        ServerMessage::LoginError { reason } => {
-            Err(format!("login failed: {reason}").into())
-        }
-        other => Err(format!("unexpected: {other:?}").into()),
+        ServerMessage::LoginError { reason } => Err(reason),
+        other => Err(format!("unexpected: {other:?}")),
     }
 }
 
@@ -102,13 +96,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let port: u16 = parts.get(1)
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(7331);
-                let id = identity.clone();
-                let dbc = db.clone();
+                let id2 = identity.clone();
+                let dbc2 = db.clone();
                 tokio::spawn(async move {
-                    match p2p::listen(id, port, dbc).await {
-                        Ok(()) => println!("listen finished"),
-                        Err(e) => eprintln!("listen error: {e}"),
+                    if let Err(e) = p2p::listen(id2, port, dbc2).await {
+                        eprintln!("listen error: {e}");
                     }
+                });
+                // announce port to server (separate connection)
+                let id2 = identity.clone();
+                tokio::spawn(async move {
+                    let mut s = match auth_with_server(&id2).await {
+                        Ok(s) => s,
+                        Err(e) => { eprintln!("announce auth failed: {e}"); return; }
+                    };
+                    if let Ok(()) = p2p::announce(&mut s, port, port.wrapping_add(1)).await {
+                        println!("announced port {port}");
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                 });
                 println!("listening on port {port}");
             }
