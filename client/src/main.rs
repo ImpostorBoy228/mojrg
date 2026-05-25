@@ -72,6 +72,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db_path = std::path::Path::new(&identity_path).with_extension("db");
     let db = MessageDb::open(&db_path)?;
 
+    if let Some(id) = identity.diddy_id {
+        println!("your diddy_id: {id}");
+    }
     println!("type 'help' for commands");
     print!("> ");
     let _ = std::io::stdout().flush();
