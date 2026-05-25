@@ -25,9 +25,23 @@ fn read_password(prompt: &str) -> io::Result<String> {
 }
 
 const SERVER_ADDR: &str = "127.0.0.1:2888";
-const IDENTITY_FILE: &str = "identity.bin";
 
-async fn register_with_server() -> Result<LocalIdentity, Box<dyn std::error::Error>> {
+fn parse_args() -> (String, String, Vec<String>) {
+    let args: Vec<String> = std::env::args().collect();
+    match args.get(1).map(String::as_str) {
+        Some("listen") | Some("connect") => {
+            ("identity.bin".into(), args[1].clone(), args[2..].to_vec())
+        }
+        Some(_) if args.len() >= 3 => {
+            (args[1].clone(), args[2].clone(), args[3..].to_vec())
+        }
+        _ => {
+            ("identity.bin".into(), String::new(), vec![])
+        }
+    }
+}
+
+async fn register_with_server(identity_path: &str) -> Result<LocalIdentity, Box<dyn std::error::Error>> {
     let mut stream = TcpStream::connect(SERVER_ADDR).await?;
     let pw = read_password("new password: ")?;
 
@@ -51,9 +65,9 @@ async fn register_with_server() -> Result<LocalIdentity, Box<dyn std::error::Err
         } => {
             id.diddy_id = Some(diddy_id);
             id.server_signature = Some(signature.to_vec());
-            id.save(IDENTITY_FILE)?;
+            id.save(identity_path)?;
             println!("registered! diddy_id = {diddy_id}");
-            println!("identity saved -> {IDENTITY_FILE}");
+            println!("identity saved -> {identity_path}");
             id.unlock(&pw)?;
             Ok(id)
         }
@@ -64,8 +78,8 @@ async fn register_with_server() -> Result<LocalIdentity, Box<dyn std::error::Err
     }
 }
 
-async fn load_and_unlock() -> Result<Option<LocalIdentity>, Box<dyn std::error::Error>> {
-    if let Some(mut id) = LocalIdentity::load(IDENTITY_FILE)? {
+async fn load_and_unlock(identity_path: &str) -> Result<Option<LocalIdentity>, Box<dyn std::error::Error>> {
+    if let Some(mut id) = LocalIdentity::load(identity_path)? {
         let pw = read_password("password: ")?;
         id.unlock(&pw).map_err(|_| "wrong password, you a opp")?;
         Ok(Some(id))
@@ -81,28 +95,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let identity = match load_and_unlock().await? {
+    let (identity_path, cmd, rest) = parse_args();
+
+    let identity = match load_and_unlock(&identity_path).await? {
         Some(id) => id,
-        None => register_with_server().await?,
+        None => register_with_server(&identity_path).await?,
     };
 
     let db = MessageDb::open("mojrg_client.db")?;
 
-    let args: Vec<String> = std::env::args().collect();
-    match args.get(1).map(String::as_str) {
-        Some("listen") => {
-            let port: u16 = args
-                .get(2)
+    match cmd.as_str() {
+        "listen" => {
+            let port: u16 = rest.first()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(7331);
             p2p::listen(identity, port, db).await?;
         }
-        Some("connect") => {
-            let addr = args.get(2).expect("usage: connect <addr>");
+        "connect" => {
+            let addr = rest.first().expect("usage: connect <addr>");
             p2p::connect(identity, addr, db).await?;
         }
         _ => {
-            eprintln!("usage: {} listen <port> | connect <addr>", args[0]);
+            eprintln!("usage: {} [identity_file] listen <port> | connect <addr>", std::env::args().next().unwrap_or_default());
         }
     }
 
