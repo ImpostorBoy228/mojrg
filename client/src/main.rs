@@ -3,6 +3,7 @@ mod identity;
 mod p2p;
 mod protocol;
 
+use crate::crypto::SERVER_PUBKEY;
 use identity::LocalIdentity;
 use protocol::*;
 use std::io::{self, BufRead, Write};
@@ -22,12 +23,6 @@ fn read_password(prompt: &str) -> io::Result<String> {
 }
 
 const SERVER_ADDR: &str = "127.0.0.1:2888";
-const SERVER_PUBKEY: [u8; 32] = [
-    0x32, 0xb0, 0xdb, 0x8e, 0x30, 0xdc, 0xa2, 0xc4,
-    0x07, 0x25, 0xfb, 0xfb, 0xc4, 0x66, 0x9d, 0x4c,
-    0xe0, 0x70, 0xaa, 0x25, 0xf9, 0x6f, 0x76, 0x56,
-    0xab, 0x2a, 0x4c, 0x53, 0x79, 0x5f, 0xf6, 0x7f,
-];
 const IDENTITY_FILE: &str = "identity.bin";
 
 async fn register_with_server() -> Result<LocalIdentity, Box<dyn std::error::Error>> {

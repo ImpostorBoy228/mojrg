@@ -1,17 +1,10 @@
-use crate::crypto;
+use crate::crypto::{self, SERVER_PUBKEY};
 use crate::identity::LocalIdentity;
 use crate::protocol::*;
 use rand::rngs::OsRng;
 use rand::RngCore;
 use tokio::net::{TcpListener, TcpStream};
 use x25519_dalek::{EphemeralSecret, PublicKey};
-
-const SERVER_PUBKEY: [u8; 32] = [
-    0x32, 0xb0, 0xdb, 0x8e, 0x30, 0xdc, 0xa2, 0xc4,
-    0x07, 0x25, 0xfb, 0xfb, 0xc4, 0x66, 0x9d, 0x4c,
-    0xe0, 0x70, 0xaa, 0x25, 0xf9, 0x6f, 0x76, 0x56,
-    0xab, 0x2a, 0x4c, 0x53, 0x79, 0x5f, 0xf6, 0x7f,
-];
 
 pub async fn listen(identity: LocalIdentity, port: u16) -> Result<(), Box<dyn std::error::Error>> {
     let addr = format!("0.0.0.0:{port}");
