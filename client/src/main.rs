@@ -125,13 +125,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // auth a fresh connection for this chat
                 match auth_with_server(&identity).await {
                     Ok(stream) => {
-                        let id = identity.clone();
-                        let dbc = db.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = p2p::chat(id, stream, target, dbc).await {
-                                eprintln!("chat error: {e}");
-                            }
-                        });
+                        if let Err(e) = p2p::chat(identity.clone(), stream, target, db.clone()).await {
+                            eprintln!("chat error: {e}");
+                        }
+                        println!("\n--- chat ended ---");
                     }
                     Err(e) => eprintln!("auth failed: {e}"),
                 }
